@@ -1,0 +1,2 @@
+video_path,title,description,tags,category_id,privacy_status
+videos/sample.mp4,Sample Short,This is a sample description for a YouTube Short,#shorts #sample,22,public
