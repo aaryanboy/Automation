@@ -13,7 +13,7 @@ import subprocess
 import imageio_ffmpeg
 import yt_dlp
 import json
-from moviepy import VideoFileClip
+import re
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -102,7 +102,7 @@ def get_flow(state=None):
     return flow
 
 
-def trim_video_for_shorts(video_path, max_duration=178.0):
+def trim_video_for_shorts(video_path, meta=None, max_duration=178.0):
     """
     Checks the video duration and aspect ratio. 
     If duration is over limits or aspect ratio isn't 9:16, it correctly 
@@ -110,11 +110,31 @@ def trim_video_for_shorts(video_path, max_duration=178.0):
     to the file to upload and a boolean indicating if it's a temp file.
     """
     try:
-        clip = VideoFileClip(video_path)
-        duration = clip.duration
-        w, h = clip.size
-        clip.close()
+        duration, w, h = 0, 0, 0
         
+        # 1. Try to get it from yt-dlp metadata first (fastest)
+        if meta and meta.get("duration") and meta.get("width") and meta.get("height"):
+            duration = float(meta["duration"])
+            w = int(meta["width"])
+            h = int(meta["height"])
+        
+        # 2. Fallback to extracting from FFMPEG output string using RegEx
+        if duration == 0 or w == 0 or h == 0:
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            result = subprocess.run([ffmpeg_exe, "-i", video_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            d_match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", result.stderr)
+            if d_match:
+                duration = int(d_match.group(1)) * 3600 + int(d_match.group(2)) * 60 + float(d_match.group(3))
+                
+            res_match = re.search(r"Stream #.*: Video: .*, (\d+)x(\d+)[,\s]", result.stderr)
+            if res_match:
+                w, h = int(res_match.group(1)), int(res_match.group(2))
+                
+        if w == 0 or h == 0:
+            print(f"  Warning: Could not determine resolution. Skipping padding.")
+            return video_path, False
+            
         aspect_ratio = w / h
         # Ideal Shorts ratio is 9:16 (0.5625). If it's too wide (>0.6) or too skinny (<0.5), pad it.
         needs_padding = abs(aspect_ratio - (9/16)) > 0.05
@@ -476,6 +496,7 @@ def upload():
         base_name = os.path.splitext(original_path)[0]
         json_path = base_name + ".info.json"
         
+        meta = None
         if os.path.exists(json_path):
             with open(json_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
@@ -491,7 +512,7 @@ def upload():
                     yt_title = "TikTok Video"
         
         # Trim video if necessary
-        upload_path, is_temp = trim_video_for_shorts(original_path)
+        upload_path, is_temp = trim_video_for_shorts(original_path, meta=meta)
         
         upload_success = False
         try:
@@ -538,4 +559,7 @@ def upload():
 # ── Main ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("YouTube Shorts Auto-Upload Bot")
-    app.run(host="0.0.0.0", port=7860)
+    if os.environ.get("FLASK_ENV") == "development":
+        app.run(host="localhost", port=5000, debug=True)
+    else:
+        app.run(host="0.0.0.0", port=7860)
