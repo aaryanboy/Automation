@@ -14,13 +14,16 @@ import imageio_ffmpeg
 import yt_dlp
 import json
 from moviepy import VideoFileClip
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ── Config ──────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = "shorts-automation-secret-key"
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "shorts-automation-secret-key")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # Allow HTTP for local dev (remove in production)
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+if os.environ.get("FLASK_ENV") == "development":
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 CLIENT_SECRETS_FILE = "credentials.json"   # OAuth client secret from Google Cloud
@@ -62,6 +65,41 @@ def save_credentials(creds):
 def get_youtube_client(creds):
     """Build and return an authenticated YouTube API client."""
     return build("youtube", "v3", credentials=creds)
+
+
+def get_flow(state=None):
+    """Dynamically build the OAuth flow based on environment."""
+    client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    
+    if os.environ.get("FLASK_ENV") == "development":
+        redirect_uri = "http://localhost:5000/callback"
+    else:
+        redirect_uri = "https://god69851-shorts.hf.space/callback"
+
+    if client_id and client_secret:
+        client_config = {
+            "web": {
+                "client_id": client_id,
+                "project_id": "shorts-automation",
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_secret": client_secret,
+                "redirect_uris": [redirect_uri]
+            }
+        }
+        flow = google_auth_oauthlib.flow.Flow.from_client_config(
+            client_config, scopes=SCOPES, state=state
+        )
+    else:
+        # Fallback to local secrets file
+        flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+            CLIENT_SECRETS_FILE, scopes=SCOPES, state=state
+        )
+    
+    flow.redirect_uri = redirect_uri
+    return flow
 
 
 def trim_video_for_shorts(video_path, max_duration=178.0):
@@ -336,10 +374,7 @@ def index():
 
 @app.route("/login")
 def login():
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES
-    )
-    flow.redirect_uri = url_for("callback", _external=True)
+    flow = get_flow()
 
     auth_url, state = flow.authorization_url(
         access_type="offline",       # Get refresh token
@@ -356,10 +391,7 @@ def login():
 @app.route("/callback")
 def callback():
     state = flask.session.get("state")
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE, scopes=SCOPES, state=state
-    )
-    flow.redirect_uri = url_for("callback", _external=True)
+    flow = get_flow(state=state)
 
     # Restore PKCE code verifier from session
     flow.code_verifier = flask.session.get("code_verifier")
@@ -506,5 +538,4 @@ def upload():
 # ── Main ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("YouTube Shorts Auto-Upload Bot")
-    print(f"Place .mp4 files in '{VIDEO_DIR}/' and visit http://localhost:5000")
-    app.run("localhost", 5000, debug=True)
+    app.run(host="0.0.0.0", port=7860)

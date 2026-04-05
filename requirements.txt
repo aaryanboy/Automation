@@ -1,6 +1,9 @@
-flask
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
-moviepy
-yt-dlp
+Flask==3.0.3
+google-auth==2.35.0
+google-auth-oauthlib==1.2.0
+google-api-python-client==2.146.0
+imageio-ffmpeg==0.5.1
+yt-dlp==2024.10.22
+moviepy==1.0.3
+werkzeug==3.0.4
+gunicorn==23.0.0
