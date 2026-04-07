@@ -27,7 +27,7 @@ if os.environ.get("FLASK_ENV") == "development":
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 CLIENT_SECRETS_FILE = "credentials.json"   # OAuth client secret from Google Cloud
-TOKEN_FILE = "token.pkl"                    # Persisted credentials (login once)
+
 VIDEO_DIR = "videos"                        # Folder containing .mp4 files
 TEMP_DIR = os.path.join(VIDEO_DIR, "temp")  # Folder for downloaded TikToks
 
@@ -36,14 +36,20 @@ os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 
-# ── Helpers ─────────────────────────────────────────────────────────
 def load_credentials():
-    """Load saved credentials from token.pkl. Returns None if not found or invalid."""
-    if not os.path.exists(TOKEN_FILE):
+    """Load saved credentials from flask session. Returns None if not found or invalid."""
+    if 'credentials' not in flask.session:
         return None
 
-    with open(TOKEN_FILE, "rb") as f:
-        creds = pickle.load(f)
+    creds_data = flask.session['credentials']
+    creds = google.oauth2.credentials.Credentials(
+        token=creds_data.get('token'),
+        refresh_token=creds_data.get('refresh_token'),
+        token_uri=creds_data.get('token_uri'),
+        client_id=creds_data.get('client_id'),
+        client_secret=creds_data.get('client_secret'),
+        scopes=creds_data.get('scopes')
+    )
 
     # Refresh if expired
     if creds and creds.expired and creds.refresh_token:
@@ -57,9 +63,15 @@ def load_credentials():
 
 
 def save_credentials(creds):
-    """Persist credentials to token.pkl."""
-    with open(TOKEN_FILE, "wb") as f:
-        pickle.dump(creds, f)
+    """Persist credentials to flask session for multi-user isolation."""
+    flask.session['credentials'] = {
+        'token': creds.token,
+        'refresh_token': creds.refresh_token,
+        'token_uri': creds.token_uri,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'scopes': creds.scopes
+    }
 
 
 def get_youtube_client(creds):
@@ -426,8 +438,7 @@ def callback():
 
 @app.route("/logout")
 def logout():
-    if os.path.exists(TOKEN_FILE):
-        os.remove(TOKEN_FILE)
+    flask.session.pop('credentials', None)
     return redirect(url_for("index"))
 
 
