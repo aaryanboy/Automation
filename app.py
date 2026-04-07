@@ -383,7 +383,7 @@ def index():
                 </div>
                 <button type="submit" class="btn">Post</button>
             </form>
-            ''' if logged_in else "<a href='/login' class='btn btn-login'>Login with Google</a>"}
+            ''' if logged_in else "<a href='/login' target='_blank' class='btn btn-login'>Login with Google</a>"}
             
             { "<a href='/logout' class='logout-link'>Sign Out</a>" if logged_in else "" }
         </div>
