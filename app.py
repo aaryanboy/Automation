@@ -94,35 +94,110 @@ def _get_flow(state=None):
 
 # ─────────────────────────────────────────────
 # Video processing
-# Always runs FFmpeg — guarantees:
-#   • 1080x1920 (9:16) with black bars for non-vertical content
-#   • AAC audio present every time
-#   • Trimmed to 178s max
-#   • +faststart for faster YouTube processing
+#
+# Strategy: check what the video actually needs,
+# then do the minimum work possible.
+#
+#   Case 1 — correct aspect ratio, has audio, under 178s
+#            → upload as-is, zero FFmpeg
+#
+#   Case 2 — needs trimming only (already 9:16, has audio)
+#            → stream copy trim, near-zero CPU
+#
+#   Case 3 — needs padding or missing audio
+#            → full re-encode (unavoidable)
 # ─────────────────────────────────────────────
-def process_for_shorts(input_path, tmp_dir, max_duration=178.0):
+def probe_video(path):
+    """
+    Run a fast FFmpeg probe (no decoding) and return
+    (duration_seconds, width, height, has_audio).
+    """
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    result = subprocess.run(
+        [ffmpeg, "-i", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stderr = result.stderr
+
+    duration = 0.0
+    import re
+    d = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", stderr)
+    if d:
+        duration = int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3))
+
+    width, height = 0, 0
+    v = re.search(r"Stream #.*Video.*?,\s*(\d+)x(\d+)", stderr)
+    if v:
+        width, height = int(v.group(1)), int(v.group(2))
+
+    has_audio = "Audio:" in stderr
+
+    return duration, width, height, has_audio
+
+
+def process_for_shorts(input_path, tmp_dir, info=None, max_duration=178.0):
+    """
+    Smart processing — only does what's actually needed.
+    Uses duration/dimensions from yt-dlp info dict when available
+    to avoid a probe call entirely.
+    """
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+    # Try to get values from info dict first (free, already in memory)
+    duration = float((info or {}).get("duration") or 0)
+    width    = int((info or {}).get("width")    or 0)
+    height   = int((info or {}).get("height")   or 0)
+
+    # If info dict didn't have them, probe the file (fast, no decode)
+    if not duration or not width or not height:
+        probed_dur, probed_w, probed_h, has_audio = probe_video(input_path)
+        duration  = duration  or probed_dur
+        width     = width     or probed_w
+        height    = height    or probed_h
+    else:
+        # Still need to know if audio exists — check info dict
+        # yt-dlp sets "acodec" to "none" when there's no audio track
+        acodec    = (info or {}).get("acodec", "unknown")
+        has_audio = acodec != "none"
+
+    needs_trim    = duration > max_duration
+    needs_pad     = (height == 0) or (width / height) > (9 / 16 + 0.05)  # wider than 9:16
+    needs_reencode = needs_pad or not has_audio
+
     fd, out = tempfile.mkstemp(suffix=".mp4", dir=tmp_dir)
     os.close(fd)
 
-    result = subprocess.run([
-        ffmpeg, "-y", "-i", input_path,
-        "-t", str(max_duration),
-        "-vf", (
-            "scale=1080:1920:force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-            "setsar=1"
-        ),
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "44100",
-        "-movflags", "+faststart",
-        out,
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if not needs_trim and not needs_reencode:
+        # Perfect as-is — skip FFmpeg entirely, just return original path
+        os.close(os.open(out, os.O_WRONLY))  # clean up the unused temp file
+        os.unlink(out)
+        return input_path
 
+    cmd = [ffmpeg, "-y", "-i", input_path]
+
+    if needs_trim:
+        cmd += ["-t", str(max_duration)]
+
+    if needs_reencode:
+        # Full re-encode: fix aspect ratio and/or missing audio
+        cmd += [
+            "-vf", (
+                "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
+                "setsar=1"
+            ),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-movflags", "+faststart",
+        ]
+    else:
+        # Trim only — stream copy, basically zero CPU
+        cmd += ["-c", "copy"]
+
+    cmd.append(out)
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode())
     return out
@@ -314,7 +389,6 @@ def render_page(logged_in, success=False, error=""):
     word-break: break-word;
   }}
 
-  /* Loading overlay */
   #overlay {{
     display: none;
     position: fixed;
@@ -343,7 +417,7 @@ def render_page(logged_in, success=False, error=""):
     transition: color 0.3s;
   }}
   .step.active {{ color: #e8e8e8; }}
-  .step.done {{ color: #4ade80; }}
+  .step.done   {{ color: #4ade80; }}
 
   .step-dot {{
     width: 7px;
@@ -364,7 +438,6 @@ def render_page(logged_in, success=False, error=""):
     50%       {{ box-shadow: 0 0 0 6px rgba(232,232,232,0.04); }}
   }}
 
-  /* Toast */
   .toast {{
     position: fixed;
     bottom: 24px;
@@ -417,11 +490,7 @@ function doSubmit() {{
   const url = document.getElementById("url").value.trim();
   if (!url) return;
 
-  const overlay = document.getElementById("overlay");
-  overlay.style.display = "flex";
-
-  // Animate steps based on rough real-world timing:
-  // download ~6s, ffmpeg ~12s, upload ~8s
+  document.getElementById("overlay").style.display = "flex";
   activate("s1", 0);
   activate("s2", 6000);
   activate("s3", 18000);
@@ -430,9 +499,7 @@ function doSubmit() {{
   form.method = "POST";
   form.action = "/post";
   const inp = document.createElement("input");
-  inp.type = "hidden";
-  inp.name = "url";
-  inp.value = url;
+  inp.type = "hidden"; inp.name = "url"; inp.value = url;
   form.appendChild(inp);
   document.body.appendChild(form);
   form.submit();
@@ -517,8 +584,7 @@ def post():
 
     tmp = tempfile.mkdtemp(dir=TEMP_DIR)
     try:
-        # 1. Download — metadata comes straight from the info dict,
-        #    no writeinfojson so no extra file written to disk
+        # 1. Download
         with yt_dlp.YoutubeDL({
             "format": "bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
@@ -537,15 +603,14 @@ def post():
         if not video_path:
             raise FileNotFoundError("Download produced no video file.")
 
-        # 3. Metadata from info dict (no disk read needed)
-        raw_title = info.get("title") or ""
-        title = (raw_title[:90] + "…") if len(raw_title) > 95 else (raw_title or "TikTok Video")
+        # 3. Metadata from info dict (no disk read)
+        raw_title   = info.get("title") or ""
+        title       = (raw_title[:90] + "…") if len(raw_title) > 95 else (raw_title or "TikTok Video")
         description = info.get("description") or raw_title or ""
-        tags = list(info.get("tags") or [])
+        tags        = list(info.get("tags") or [])
 
-        # 4. Process — always runs FFmpeg:
-        #    forces 9:16 with black bars + guaranteed AAC audio
-        processed = process_for_shorts(video_path, tmp)
+        # 4. Smart process — only re-encodes if actually needed
+        processed = process_for_shorts(video_path, tmp, info=info)
 
         # 5. Upload
         yt = build("youtube", "v3", credentials=creds)
